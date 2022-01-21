@@ -1054,6 +1054,7 @@ class HiroGraphBatch:
                 executor.submit(HiroGraphBatch._reader, self, collected_results)
 
                 handle_session_data = False
+                attributes = None
                 for command_entry in command_iter:
                     for command, attributes in command_entry.items():
 

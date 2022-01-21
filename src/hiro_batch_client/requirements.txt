@@ -1,0 +1,9 @@
+requests~=2.25.1
+backoff~=1.10.0
+
+
+setuptools~=56.1.0
+websocket-client~=0.59.0
+apscheduler~=3.7.0
+
+hiro-client-python~=5.0.0

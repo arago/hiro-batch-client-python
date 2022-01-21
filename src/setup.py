@@ -16,7 +16,7 @@ with open(path.join(this_directory, '../CHANGELOG.md'), encoding='utf-8') as fc:
 
 subversion = timestamp.make_timestamp()
 
-name = 'hiro_graph_client'
+name = 'hiro_batch_client'
 
 __version__ = version_by_git.create_version_file(name)
 
@@ -28,8 +28,8 @@ setup(
 
     install_requires=[
         'wheel',
-        'requests'
-        'hiro-graph-client'
+        'requests',
+        'hiro-graph-client>=5.0.0'
     ],
     package_data={
         name: ['VERSION']

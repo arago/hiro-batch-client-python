@@ -1,3 +1,7 @@
+# v1.0.2
+
+[bugfix] Avoid UnboundLocalError when exception occurs immediately at iterating over batch data.
+
 # v1.0.1
 
 [bugfix] Avoid read-in deadlock

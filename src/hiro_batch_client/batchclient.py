@@ -4,10 +4,9 @@ from abc import abstractmethod
 from enum import Enum
 from typing import Optional, Tuple, Any, Iterator, IO
 
-from requests.exceptions import RequestException
-
 from hiro_graph_client.client import HiroGraph
 from hiro_graph_client.clientlib import AbstractTokenApiHandler
+from requests.exceptions import RequestException
 
 
 class Result(Enum):
@@ -491,7 +490,8 @@ class HiroBatchRunner:
                       action: Action,
                       error: Exception,
                       original: dict,
-                      status_code: int = None) -> dict:
+                      status_code: int = None,
+                      interrupted: bool = None) -> dict:
         """
         Failure message format
 
@@ -513,8 +513,15 @@ class HiroBatchRunner:
         :param error: The exception raised
         :param original: The data that lead to the exception
         :param status_code: HTTP status code if available
+        :param interrupted: Indicates, that the current batch processing has been interrupted.
         :return: The message
         """
+
+        message = str(error)
+        if interrupted:
+            message = "BATCH PROCESSING ABORTED! " + message + \
+                      " All further data has been ignored after this error occurred."
+
         return {
             "status": Result.FAILURE.value,
             "entity": entity.value,
@@ -522,7 +529,7 @@ class HiroBatchRunner:
             "data": {
                 "error": error.__class__.__name__,
                 "code": status_code,
-                "message": str(error),
+                "message": message,
                 "original_data": original
             }
         }
@@ -1037,67 +1044,85 @@ class HiroGraphBatch:
                 self.request_queue.put((_command, _attributes))
                 return _parallel_workers
 
-            session = SessionData(self.use_xid_cache)
-
-            collected_results = [] if self.callback is None else None
-
             parallel_workers = 0
 
-            executor.submit(HiroGraphBatch._reader, self, collected_results)
+            try:
+                session = SessionData(self.use_xid_cache)
 
-            handle_session_data = False
-            for command_entry in command_iter:
-                for command, attributes in command_entry.items():
+                collected_results = [] if self.callback is None else None
 
-                    if command == "handle_vertices_combined":
-                        command = "handle_vertices"
-                        handle_session_data = True
+                executor.submit(HiroGraphBatch._reader, self, collected_results)
 
-                    try:
-                        if command not in self.command_map:
-                            raise SourceValueError("No such command \"{}\".".format(command))
+                handle_session_data = False
+                for command_entry in command_iter:
+                    for command, attributes in command_entry.items():
 
-                        if isinstance(attributes, list):
-                            for attribute_entry in attributes:
+                        if command == "handle_vertices_combined":
+                            command = "handle_vertices"
+                            handle_session_data = True
+
+                        try:
+                            if command not in self.command_map:
+                                raise SourceValueError("No such command \"{}\".".format(command))
+
+                            if isinstance(attributes, list):
+                                for attribute_entry in attributes:
+                                    parallel_workers = _request_queue_put(
+                                        command,
+                                        attribute_entry,
+                                        parallel_workers)
+                            else:
                                 parallel_workers = _request_queue_put(
                                     command,
-                                    attribute_entry,
+                                    attributes,
                                     parallel_workers)
-                        else:
-                            parallel_workers = _request_queue_put(
-                                command,
-                                attributes,
-                                parallel_workers)
 
-                    except SourceValueError as err:
-                        sub_result, sub_code = HiroBatchRunner.error_message(
-                            Entity.UNDEFINED,
-                            Action.UNDEFINED,
-                            err,
-                            attributes,
-                            400), 400
+                            # Empty old attributes, so they do not show up on exceptions
+                            # that might be thrown before the new attributes have been
+                            # read (i.e. read-in-exceptions while iterating over *command_iter*).
+                            attributes = None
 
-                        self.result_queue.put((sub_result, sub_code))
+                        except SourceValueError as err:
+                            sub_result, sub_code = HiroBatchRunner.error_message(
+                                entity=Entity.UNDEFINED,
+                                action=Action.UNDEFINED,
+                                error=err,
+                                original=attributes,
+                                status_code=400), 400
 
-            if handle_session_data:
+                            self.result_queue.put((sub_result, sub_code))
+
+                if handle_session_data:
+                    self.request_queue.join()
+                    self._edges_from_session(session)
+                    self._timeseries_from_session(session)
+                    self._attachments_from_session(session)
+                    # Ensure, that all data related to the original vertex has been sent
+                    # before creating any issues.
+                    self.request_queue.join()
+                    self._issues_from_session(session)
+
+                return collected_results
+
+            except Exception as err:
+                sub_result, sub_code = HiroBatchRunner.error_message(
+                    entity=Entity.UNDEFINED,
+                    action=Action.UNDEFINED,
+                    error=err,
+                    original=attributes,
+                    status_code=400,
+                    interrupted=True), 400
+
+                self.result_queue.put((sub_result, sub_code))
+
+            finally:
                 self.request_queue.join()
-                self._edges_from_session(session)
-                self._timeseries_from_session(session)
-                self._attachments_from_session(session)
-                # Ensure, that all data related to the original vertex has been sent
-                # before creating any issues.
-                self.request_queue.join()
-                self._issues_from_session(session)
+                self.result_queue.join()
 
-            self.request_queue.join()
-            self.result_queue.join()
+                for _ in range(parallel_workers):
+                    self.request_queue.put(None)
 
-            for _ in range(parallel_workers):
-                self.request_queue.put(None)
-
-            self.result_queue.put(None)
-
-            return collected_results
+                self.result_queue.put(None)
 
 
 class SourceValueError(ValueError):

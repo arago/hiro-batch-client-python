@@ -1,4 +1,5 @@
 import concurrent.futures
+import logging
 import queue
 from abc import abstractmethod
 from enum import Enum
@@ -7,6 +8,9 @@ from typing import Optional, Tuple, Any, Iterator, IO
 from hiro_graph_client.client import HiroGraph
 from hiro_graph_client.clientlib import AbstractTokenApiHandler
 from requests.exceptions import RequestException
+
+logger = logging.getLogger(__name__)
+""" The logger for this module """
 
 
 class Result(Enum):
@@ -460,7 +464,7 @@ class HiroBatchRunner:
         return key, value
 
     @staticmethod
-    def success_message(entity: Entity, action: Action, data: dict) -> dict:
+    def success_message(entity: Entity, action: Action, order: int, data: dict) -> dict:
         """
         Success message format
 
@@ -470,26 +474,30 @@ class HiroBatchRunner:
                 "status": "success",
                 "entity": entity.value,
                 "action": action.value,
+                "order": order,
                 "data": data
             }
 
         :param entity: Entity handled
         :param action: Action done
         :param data: JSON to return
+        :param order: Running number of commands.
         :return: The message
         """
         return {
             "status": Result.SUCCESS.value,
             "entity": entity.value,
             "action": action.value,
+            "order": order,
             "data": data
         }
 
     @staticmethod
     def error_message(entity: Entity,
                       action: Action,
+                      order: int,
                       error: Exception,
-                      original: dict,
+                      original: Optional[dict],
                       status_code: int = None,
                       interrupted: bool = None) -> dict:
         """
@@ -501,6 +509,7 @@ class HiroBatchRunner:
                 "status": "fail",
                 "entity": entity.value,
                 "action": action.value,
+                "order": order,
                 "data": {
                     "error": error.__class__.__name__,
                     "message": str(error),
@@ -510,6 +519,7 @@ class HiroBatchRunner:
 
         :param entity: Entity handled
         :param action: Action done
+        :param order: Running number of commands.
         :param error: The exception raised
         :param original: The data that lead to the exception
         :param status_code: HTTP status code if available
@@ -526,6 +536,7 @@ class HiroBatchRunner:
             "status": Result.FAILURE.value,
             "entity": entity.value,
             "action": action.value,
+            "order": order,
             "data": {
                 "error": error.__class__.__name__,
                 "code": status_code,
@@ -534,7 +545,7 @@ class HiroBatchRunner:
             }
         }
 
-    def run(self, attributes: dict, result_queue: queue.Queue) -> None:
+    def run(self, attributes: dict, order: int, result_queue: queue.Queue) -> None:
         """
         Run the Command with all data given by *attributes*.
 
@@ -542,31 +553,33 @@ class HiroBatchRunner:
         the *attributes* is defined in derived ...Runner-classes.
 
         :param attributes: Dict with attributes to handle in HIRO.
+        :param order: Number of the command read from the *self._request_queue*.
         :param result_queue: Queue receiving the results.
         """
         try:
             response: dict = self.run_item(attributes)
 
             response_code = 200
-            message = self.success_message(self.entity, self.action, response)
+            message = self.success_message(self.entity, self.action, order, response)
 
         except RequestException as error:
             response_code = error.response.status_code if error.response is not None else 999
             message = self.error_message(self.entity,
                                          self.action,
+                                         order,
                                          error,
                                          attributes,
                                          response_code)
 
         except SourceValueError as error:
             response_code = 400
-            message = self.error_message(self.entity, self.action, error, attributes, 400)
+            message = self.error_message(self.entity, self.action, order, error, attributes, 400)
 
         except Exception as error:
             response_code = 500
-            message = self.error_message(self.entity, self.action, error, attributes, 500)
+            message = self.error_message(self.entity, self.action, order, error, attributes, 500)
 
-        result_queue.put((message, response_code))
+        result_queue.put((message, response_code, order))
 
     @abstractmethod
     def run_item(self, attributes: dict) -> dict:
@@ -829,6 +842,11 @@ class HiroGraphBatch:
     request_queue: queue.Queue
     result_queue: queue.Queue
 
+    _parallel_workers: int
+    """Counts the current amount of parallel workers."""
+    _order: int
+    """Counts the commands that have been put onto the request_queue and the errors that prevent that."""
+
     callback: HiroResultCallback
 
     _api_handler: AbstractTokenApiHandler
@@ -877,13 +895,16 @@ class HiroGraphBatch:
         self.callback = callback
 
         self.max_parallel_workers = max_parallel_workers
+        self._parallel_workers = 0
+        self._order = 0
 
         self.use_xid_cache = False if use_xid_cache is False else True
 
-    def _edges_from_session(self, session: SessionData) -> None:
+    def _edges_from_session(self, executor: concurrent.futures.ThreadPoolExecutor, session: SessionData) -> None:
         """
         Recreate attributes to create edges saved in a session.
 
+        :param executor: The thread executor to create additional threads if necessary.
         :param session: The session with the edge data.
         """
         for ogit_id, edge_data in session.edge_store.items():
@@ -909,12 +930,13 @@ class HiroGraphBatch:
                     else:
                         attributes["to:ogit/_xid"] = other_ogit_xid
 
-                self.request_queue.put(('create_edges', attributes))
+                self._request_queue_put(executor, session, 'create_edges', attributes)
 
-    def _timeseries_from_session(self, session: SessionData) -> None:
+    def _timeseries_from_session(self, executor: concurrent.futures.ThreadPoolExecutor, session: SessionData) -> None:
         """
         Recreate attributes to create timeseries saved in a session.
 
+        :param executor: The thread executor to create additional threads if necessary.
         :param session: The session with the timeseries data.
         """
         for ogit_id, timeseries_data in session.timeseries_store.items():
@@ -923,12 +945,13 @@ class HiroGraphBatch:
                 'items': timeseries_data
             }
 
-            self.request_queue.put(('add_timeseries', attributes))
+            self._request_queue_put(executor, session, 'add_timeseries', attributes)
 
-    def _attachments_from_session(self, session: SessionData) -> None:
+    def _attachments_from_session(self, executor: concurrent.futures.ThreadPoolExecutor, session: SessionData) -> None:
         """
         Recreate attributes to create attachments saved in a session.
 
+        :param executor: The thread executor to create additional threads if necessary.
         :param session: The session with the attachment data.
         """
         for ogit_id, content_data in session.content_store.items():
@@ -937,12 +960,13 @@ class HiroGraphBatch:
                 '_content_data': content_data
             }
 
-            self.request_queue.put(('add_attachments', attributes))
+            self._request_queue_put(executor, session, 'add_attachments', attributes)
 
-    def _issues_from_session(self, session: SessionData) -> None:
+    def _issues_from_session(self, executor: concurrent.futures.ThreadPoolExecutor, session: SessionData) -> None:
         """
         Handle issue vertices from the data saved in a session.
 
+        :param executor: The thread executor to create additional threads if necessary.
         :param session: The session with the issue data.
         """
         for ogit_id, issue_data in session.issue_store.items():
@@ -959,7 +983,7 @@ class HiroGraphBatch:
                         "ogit/Automation/originNode": ogit_id
                     })
 
-                    self.request_queue.put(('create_vertices', issue))
+                    self._request_queue_put(executor, session, 'create_vertices', issue)
 
     def _reader(self, collected_results: list) -> None:
         """
@@ -969,12 +993,16 @@ class HiroGraphBatch:
 
         Thread exits when *self.result_queue.get()* reads None.
         """
-        for result, code in iter(self.result_queue.get, None):
-            if self.callback is not None:
-                self.callback.result(result, code)
-            if collected_results is not None:
-                collected_results.append(result)
-            self.result_queue.task_done()
+        for result, code, order in iter(self.result_queue.get, None):
+            try:
+                if self.callback is not None:
+                    self.callback.result(result, code)
+                if collected_results is not None:
+                    collected_results.append(result)
+            except Exception as err:
+                logger.error("Error handling result_queue.get", err)
+            finally:
+                self.result_queue.task_done()
 
     def _worker(self, session: SessionData) -> None:
         """
@@ -988,12 +1016,40 @@ class HiroGraphBatch:
 
         connection = HiroGraph(self._api_handler)
 
-        for command, attributes in iter(self.request_queue.get, None):
-            runner_ref = self.command_map.get(command)
-            if runner_ref is not None:
-                runner_ref(session, connection).run(attributes, self.result_queue)
+        for command, attributes, order in iter(self.request_queue.get, None):
+            try:
+                runner_ref = self.command_map.get(command)
+                if runner_ref is not None:
+                    runner_ref(session, connection).run(attributes, order, self.result_queue)
+            except Exception as err:
+                logger.error("Error handling request_queue.get", err)
+            finally:
+                self.request_queue.task_done()
 
-            self.request_queue.task_done()
+    def _request_queue_put(self,
+                           executor: concurrent.futures.ThreadPoolExecutor,
+                           session: SessionData,
+                           command: str,
+                           attributes: dict) -> None:
+        """
+        Put a command onto the queue. Create additional threads if necessary.
+        Also handle *self._parallel_workers* and *self._order*.
+
+        :param executor: The thread executor to create additional threads.
+        :param session: Session data object.
+        :param command: Command name to put on the queue.
+        :param attributes: Command attributes to put on the queue.
+        """
+
+        if not isinstance(attributes, dict):
+            raise SourceValueError("Found attributes that are not a dict.")
+
+        if self._parallel_workers < self.max_parallel_workers:
+            executor.submit(HiroGraphBatch._worker, self, session)
+            self._parallel_workers += 1
+
+        self.request_queue.put((command, attributes, self._order))
+        self._order += 1
 
     def multi_command(self, command_iter: Iterator[dict]) -> Optional[list]:
         """
@@ -1025,26 +1081,24 @@ class HiroGraphBatch:
 
         with payload being a list of dict containing the attributes to run with that command.
 
+        If iterating over command_iter throws an exception, the loop is aborted and an according error message
+        is given back.
+
+        If you do not want to interrupt the loop on an error, you can return/yield an exception with the command
+        "error" from the iterator. An error message will be put into the result list and operation will continue:
+
+        ::
+
+            {
+                "error": (Exception object)
+            },
+            ...
+
+
         :param command_iter: An iterator for a dict of pairs "[command]:payload".
         :return a list with results when no callback is set, None otherwise.
         """
         with concurrent.futures.ThreadPoolExecutor() as executor:
-
-            def _request_queue_put(_command: str,
-                                   _attributes: dict,
-                                   _parallel_workers: int) -> int:
-
-                if not isinstance(_attributes, dict):
-                    raise SourceValueError("Found attributes that are not a dict.")
-
-                if _parallel_workers < self.max_parallel_workers:
-                    executor.submit(HiroGraphBatch._worker, self, session)
-                    _parallel_workers += 1
-
-                self.request_queue.put((_command, _attributes))
-                return _parallel_workers
-
-            parallel_workers = 0
 
             try:
                 session = SessionData(self.use_xid_cache)
@@ -1063,20 +1117,27 @@ class HiroGraphBatch:
                             handle_session_data = True
 
                         try:
-                            if command not in self.command_map:
-                                raise SourceValueError("No such command \"{}\".".format(command))
 
-                            if isinstance(attributes, list):
-                                for attribute_entry in attributes:
-                                    parallel_workers = _request_queue_put(
-                                        command,
-                                        attribute_entry,
-                                        parallel_workers)
-                            else:
-                                parallel_workers = _request_queue_put(
+                            if command == "error":
+                                try:
+                                    attributes = str(attributes) if attributes else None
+                                except Exception as err:
+                                    attributes = err.__class__.__name__
+
+                                raise SourceValueError("Error while iterating over source.")
+
+                            if command not in self.command_map:
+                                raise SourceValueError(f"No such command \"{command}\".")
+
+                            if not isinstance(attributes, list):
+                                attributes = [attributes]
+
+                            for attribute_entry in attributes:
+                                self._request_queue_put(
+                                    executor,
+                                    session,
                                     command,
-                                    attributes,
-                                    parallel_workers)
+                                    attribute_entry)
 
                             # Empty old attributes, so they do not show up on exceptions
                             # that might be thrown before the new attributes have been
@@ -1087,21 +1148,23 @@ class HiroGraphBatch:
                             sub_result, sub_code = HiroBatchRunner.error_message(
                                 entity=Entity.UNDEFINED,
                                 action=Action.UNDEFINED,
+                                order=self._order,
                                 error=err,
                                 original=attributes,
                                 status_code=400), 400
 
-                            self.result_queue.put((sub_result, sub_code))
+                            self.result_queue.put((sub_result, sub_code, self._order))
+                            self._order += 1
 
                 if handle_session_data:
                     self.request_queue.join()
-                    self._edges_from_session(session)
-                    self._timeseries_from_session(session)
-                    self._attachments_from_session(session)
+                    self._edges_from_session(executor, session)
+                    self._timeseries_from_session(executor, session)
+                    self._attachments_from_session(executor, session)
                     # Ensure, that all data related to the original vertex has been sent
                     # before creating any issues.
                     self.request_queue.join()
-                    self._issues_from_session(session)
+                    self._issues_from_session(executor, session)
 
                 return collected_results
 
@@ -1109,19 +1172,23 @@ class HiroGraphBatch:
                 sub_result, sub_code = HiroBatchRunner.error_message(
                     entity=Entity.UNDEFINED,
                     action=Action.UNDEFINED,
+                    order=self._order,
                     error=err,
                     original=attributes,
                     status_code=400,
                     interrupted=True), 400
 
-                self.result_queue.put((sub_result, sub_code))
+                self.result_queue.put((sub_result, sub_code, self._order))
 
             finally:
                 self.request_queue.join()
                 self.result_queue.join()
 
-                for _ in range(parallel_workers):
+                for _ in range(self._parallel_workers):
                     self.request_queue.put(None)
+
+                self._parallel_workers = 0
+                self._order = 0
 
                 self.result_queue.put(None)
 

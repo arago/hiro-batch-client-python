@@ -286,6 +286,7 @@ result: dict = {
     "status": "success|fail",
     "entity": "vertex|edge|timeseries|attachment|undefined",
     "action": "create|update|delete|undefined",
+    "order": 0  # order of the commands in which they were sent to the graph. 
     "data": {
         "<On success>": "<Data of the result of the command.>",
         "<On fail>": "<Dict with a copy of the original data of the command.>"
@@ -304,6 +305,7 @@ query_results: list = [
         "status": "success",
         "entity": "vertex",
         "action": "create",
+        "order": 0,
         "data": {
             "ogit/_created-on": 1601030883647,
             "ogit/_xid": "machine4",
@@ -331,6 +333,7 @@ query_results: list = [
         "status": "success",
         "entity": "vertex",
         "action": "create",
+        "order": 1,
         "data": {
             "ogit/_created-on": 1601030883847,
             "ogit/_xid": "machine5",
@@ -358,6 +361,7 @@ query_results: list = [
         "status": "fail",
         "entity": "vertex",
         "action": "create",
+        "order": 2,
         "data": {
             "error": "HTTPError",
             "code": 500,
@@ -376,6 +380,7 @@ query_results: list = [
         "status": "fail",
         "entity": "vertex",
         "action": "create",
+        "order": 3,
         "data": {
             "error": "HTTPError",
             "code": 500,

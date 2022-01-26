@@ -1,3 +1,7 @@
+# v1.0.4
+
+* Update documentation in README.md. Added missing key "order" in result data.
+
 # v1.0.3
 
 * Allow continuing of read-in-iteration when the iterator is yielding a dict {"error", Exception}.

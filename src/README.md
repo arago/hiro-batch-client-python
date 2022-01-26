@@ -1,9 +1,9 @@
 # HIRO Batch Client
 
-This is a client library to access data of the [HIRO Graph](#graph-client-hirograph). It is meant for uploads of huge
+This is a client library to access data of the HIRO Graph. It is meant for uploads of huge
 batches of data in parallel.
 
-This library depends on the package [hiro-graph-client](https://pypi.org/project/hiro-graph-client/).
+This library depends on the package "hiro-graph-client". - (PyPI: [hiro-graph-client](https://pypi.org/project/hiro-graph-client/), GitHub: [hiro-client-python](https://github.com/arago/hiro-client-python)) 
 
 For more information about HIRO Automation, look at https://www.arago.co/
 

@@ -1,3 +1,8 @@
+# v1.0.5
+
+* Update requirements.txt to use the most recent hiro-graph-client of version 5.x.x.
+
+
 # v1.0.4
 
 * Update documentation in README.md. Added missing key "order" in result data.

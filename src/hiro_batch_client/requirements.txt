@@ -6,4 +6,4 @@ setuptools~=56.1.0
 websocket-client~=0.59.0
 apscheduler~=3.7.0
 
-hiro-graph-client~=5.0.0
+hiro-graph-client>=5.0.0
